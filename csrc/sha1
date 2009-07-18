@@ -1,0 +1,5 @@
+#!/bin/bash
+
+read COMB
+sleep 5
+echo -e "$COMB\t100"
