@@ -1,0 +1,1 @@
+First fill ~/.hosts.erlang file according to net_adm(3erl), make sure all hosts can ping with each other using long dns names and run scripts/prepare.sh.
