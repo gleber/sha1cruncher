@@ -18,19 +18,20 @@
 -define(M(S, X), io:format("master: " ++ S, X)).
 -define(W(S, X), io:format("worker ~p on ~p: " ++ S, [self(), node()] ++ X)).
 
--define(SERVER, master).
+-define(SERVER, headserv).
 
 -record(state,
 	{dict = [],
 	 best = undefined,  %% {Phrase, Score}
 	 workers = dict:new(),
-	 max = 2}).
+	 max = 1}).
 
 
 start() ->
-    gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
+    gen_server:start({local, ?SERVER}, ?MODULE, [], []).
 
 init([]) ->
+    ?M("MASTER ~p~n", [self()]),
     crypto:start(),
     process_flag(trap_exit, true),
     mnesia:create_schema([node()]),
@@ -64,7 +65,9 @@ handle_cast({done, _Pid, Combination, NewBest}, #state{best = OldBest} = State) 
     {noreply, State#state{best = Best}};
 
 handle_cast(start, State0) ->
+    process_flag(trap_exit, true),
     State = add_workers(State0),
+    ?M("~p~n", [State]),
     {noreply, State};
 handle_cast(_Msg, State) ->
     {noreply, State}.
@@ -78,14 +81,12 @@ handle_info({'EXIT', Pid, normal}, State) ->
 handle_info({'EXIT', Pid, Reason}, State) ->
     ?M("~p EXITed because ~p~n", [Pid, Reason]),
     {noreply, remove_worker(Pid, State)};
-
-
-
 handle_info(_Info, State) ->
     ?M("UNKNOWN MESSAGE ~p~n", [_Info]),
     {noreply, State}.
 
 terminate(_Reason, _State) ->
+    ?M("TERMINATING ~p ~p~n", [self(), _Reason]),
     ok.
 
 code_change(_OldVsn, State, _Extra) ->
@@ -130,7 +131,7 @@ get_new_combination(Dictionary) ->
 
 get_new_combination0(Dictionary, S) ->
     N = crypto:rand_uniform(0, 13),
-    Comb = [ array:get(crypto:rand_uniform(1, S), Dictionary) || _ <- lists:seq(1, N) ],
+    Comb = [ [array:get(crypto:rand_uniform(0, S), Dictionary), " "] || _ <- lists:seq(1, N) ],
     case mnesia:dirty_read(combination, Comb) of
 	[] ->
 	    Comb;
@@ -143,23 +144,27 @@ worker_loop0(MasterNode) ->
     worker_loop(MasterNode).
 
 worker_loop(MasterNode) ->
-    ?W("will send a request for job~n", []),
-    {ok, Combination} = gen_server:call({master, MasterNode}, {get, self()}),
-    Port = open_port({spawn, "csrc/sha1"}, [{line, 1000},
-					    use_stdio]),
-    port_command(Port, [Combination, "\n"]),
-    ?W("waiting for job to finish~n", []),
-    Line = receive
-	       {Port, {data, {eol, L}}} ->
-		   ?W("Got ~p~n", [L]),
-		   L;
-	       _X -> 
-		   ?W("Received ~p~n", [_X]),
-		   exit(badmsg)
-	   after
-	       10000 ->
-		   exit(timeout)
-	   end,					     
-    [Phrase, Score] = string:tokens(Line, "\t"),
-    gen_server:cast({master, MasterNode}, {done, self(), Combination, {Phrase, list_to_integer(Score)}}).
+    try
+	?W("will send a request for job~n", []),
+	{ok, Combination} = gen_server:call({?SERVER, MasterNode}, {get, self()}),
+	Port = open_port({spawn, "csrc/sha1"}, [{line, 1000},
+						use_stdio]),
+	port_command(Port, [Combination, "\n"]),
+	?W("waiting for job to finish~n", []),
+	Line = receive
+		   {Port, {data, {eol, L}}} ->
+		       ?W("Got ~p~n", [L]),
+		       L;
+		   _X -> 
+		       ?W("Received ~p~n", [_X]),
+		       exit(badmsg)
+	       after
+		   10000 ->
+		       exit(timeout)
+	       end,					     
+	[Phrase, Score] = string:tokens(Line, "\t"),
+	gen_server:cast({?SERVER, MasterNode}, {done, self(), Combination, {Phrase, list_to_integer(Score)}})
+    catch _E:_A ->
+	    ?W("Error! ~p:~p~n~p~n", [_E, _A, erlang:get_stacktrace()])
+    end.
 

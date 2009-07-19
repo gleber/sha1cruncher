@@ -1,5 +1,7 @@
 #!/bin/bash
 
 read COMB
-sleep 5
-echo -e "$COMB\t100"
+sleep 1
+rnd=$RANDOM
+let "rnd %= 255"
+echo -e "$COMB\t$rnd"
