@@ -11,20 +11,15 @@
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
 	 terminate/2, code_change/3]).
 
--record(combination,
-	{words,
-	 state}).
-
 -define(M(S, X), io:format("master: " ++ S, X)).
 -define(W(S, X), io:format("worker ~p on ~p: " ++ S, [self(), node()] ++ X)).
 
 -define(SERVER, headserv).
 
 -record(state,
-	{dict = [],
-	 best = undefined,  %% {Phrase, Score}
+	{best = undefined,  %% {Phrase, Score}
 	 workers = dict:new(),
-	 max = 1}).
+	 max = 3}).
 
 
 start() ->
@@ -34,12 +29,7 @@ init([]) ->
     ?M("MASTER ~p~n", [self()]),
     crypto:start(),
     process_flag(trap_exit, true),
-    mnesia:create_schema([node()]),
-    mnesia:start(),
-    mnesia:change_table_copy_type(schema, node(), disc_copies),
-    Res = mnesia:create_table(combination, [{disc_copies, [node()]}, 
-					    {attributes, record_info(fields, combination)}]),
-    ?M("RESULT ~p~n", [Res]),
+
     pool:start(worker, "-rsh ssh"),
 
     Module = main,
@@ -51,28 +41,21 @@ init([]) ->
     {Test, []} = rpc:multicall(os, cmd, ["test -f /tmp/sha1 || echo error"]),
     ?M("Done ~p~n", [Test]),
     [ "" = X || X <- Test ],
-
-    {ok, Dictionary0} = file:read_file("priv/dict.txt"),
-    Dictionary = [ list_to_binary(X) || X <- string:tokens(binary_to_list(Dictionary0), " \n") ],
+    
     Workers = lists:foldl(fun(X, D) -> dict:store(X, 0, D) end, dict:new(), pool:get_nodes()),
     gen_server:cast(self(), start),
-    {ok, #state{dict = Dictionary, workers = Workers}}.
 
-handle_call({get, Pid}, _From, #state{dict = Dictionary} = State) ->
-    ?M("~p on ~p requested combination~n", [Pid, node(Pid)]),
-    Combination = get_new_combination(Dictionary),
-    ?M("Combination for ~p on ~p~n", [Pid, node(Pid)]),
-    mnesia:dirty_write(#combination{words = Combination, state = reserved}),
-    {reply, {ok, Combination}, State}.
+    {ok, #state{workers = Workers}}.
 
-handle_cast({done, _Pid, Combination, NewBest}, #state{best = OldBest} = State) ->
+handle_call(_Call, _From, State) ->
+    {reply, ok, State}.
+
+handle_cast({done, _Pid, NewBest}, #state{best = OldBest} = State) ->
     Best = better(OldBest, NewBest),	    
-    mnesia:dirty_write(#combination{words = Combination, state = done}),
     ?M("New best is ~p~n", [OldBest]),
     {noreply, State#state{best = Best}};
 
 handle_cast(start, State0) ->
-    process_flag(trap_exit, true),
     State = add_workers(State0),
     ?M("~p~n", [State]),
     {noreply, State};
@@ -83,9 +66,6 @@ handle_cast(_Msg, State) ->
 
 
 handle_info({'EXIT', Pid, normal}, State) ->
-    ?M("pid ~p on ~p stopped~n", [Pid, node(Pid)]),
-    {noreply, State};
-handle_info({'EXIT', Pid, more}, State) ->
     ?M("pid ~p on ~p FINISHED it's work~n", [Pid, node(Pid)]),
     {noreply, remove_worker(Pid, State)};
 handle_info({'EXIT', Pid, Reason}, State) ->
@@ -134,53 +114,32 @@ remove_worker(Pid, #state{workers = Workers0} = State) ->
     add_workers(State#state{workers = dict:update_counter(node(Pid), -1, Workers0)}).
 
 
-get_new_combination(Dictionary) ->
-    Ar = array:from_list(Dictionary),
-    S = array:size(Ar),
-    lists:sort(get_new_combination0(Ar, S)).
-
-get_new_combination0(Dictionary, S) ->
-    N = crypto:rand_uniform(0, 13),
-    Comb = [ [array:get(crypto:rand_uniform(0, S), Dictionary), " "] || _ <- lists:seq(1, N) ],
-    case mnesia:dirty_read(combination, Comb) of
-	[] ->
-	    Comb;
-	[_] ->
-	    get_new_combination0(Dictionary, S)
-    end.
-
 worker_loop0(MasterNode) ->
     ?W("started, masternode ~p~n", [MasterNode]),
     worker_loop(MasterNode).
 
 worker_loop(MasterNode) ->
+    ?W("starting sha1~n", []),
+    open_port({spawn, "/tmp/sha1"}, [{line, 1000},
+				     use_stdio]),
+    ?W("waiting for messages from sha1~n", []),
 
-    ?W("will send a request for job~n", []),
-    {ok, Combination} = gen_server:call({?SERVER, MasterNode}, {get, self()}),
-    Port = open_port({spawn, "/tmp/sha1"}, [{line, 1000},
-					    use_stdio]),
-%%     receive
-%% 	{'EXIT', Port, Error} ->
-%% 	    ?W("Port is dead ~p~n", [Error]),
-%% 	    exit(Error)
-%%     after
-%% 	200 ->
-%% 	    ok
-%%     end,
-    port_command(Port, [Combination, "\n"]),
-    ?W("waiting for job to finish~n", []),
-    Line = receive
-	       {Port, {data, {eol, L}}} ->
-		   ?W("Got ~p~n", [L]),
-		   L;
-	       _X -> 
-		   ?W("Received ~p~n", [_X]),
-		   exit(badmsg)
-	   after
-	       10000 ->
-		   exit(timeout)
-	   end,					     
-    [Phrase, Score] = string:tokens(Line, "\t"),
-    gen_server:cast({?SERVER, MasterNode}, {done, self(), Combination, {Phrase, list_to_integer(Score)}}),
-    exit(more).
+    process_flag(trap_exit, true),
+    
+    worker_loop2(MasterNode).
+
+worker_loop2(MasterNode) ->
+    receive
+	{_Port, {data, {eol, L}}} ->
+	    [Score | Phrase] = string:tokens(L, " \t"),
+	    gen_server:cast({?SERVER, MasterNode}, {done, self(), {Phrase, list_to_integer(Score)}}),
+	    ?W("Got ~p~n", [L]);
+	_X -> 
+	    ?W("Received ~p~n", [_X]),
+	    exit(badmsg)
+    after
+	2147483647 ->
+	    exit(timeout)
+    end,
+    worker_loop2(MasterNode).
 
