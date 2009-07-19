@@ -1,0 +1,1 @@
+require 'digest/sha1'; 1000000.times { Digest::SHA1.hexdigest "time" }
